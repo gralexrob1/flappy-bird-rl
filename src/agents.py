@@ -121,3 +121,179 @@ class MonteCarloAgent(BaseAgent):
             episode_lengths.append(len(episode))
         self.policy = dict((k, np.argmax(v)) for k, v in self.Q.items())
         return epsilons, episode_rewards, episode_lengths
+
+
+class SarsaAgent(BaseAgent):
+
+    def __init__(self, env, alpha, gamma, epsilon=1.0, epsilon_decay=0.99, epsilon_min=0.1):
+        super().__init__(env, gamma, epsilon, epsilon_decay, epsilon_min)
+        self.alpha = alpha
+
+    def update_Q(self, state, action, reward, next_state, next_action):
+        Q = self.Q[state][action]
+        next_Q = self.Q[next_state][next_action]
+        target = reward + self.gamma * next_Q
+        self.Q[state][action] = Q + self.alpha * (target - Q)
+
+    def train(self, num_episode, max_reward=10_000):
+        epsilons = []
+        rewards = []
+        for _ in tqdm(range(num_episode)):
+            epsilons.append(self.epsilon)
+            state, info = self.env.reset()
+            action = self.epsilon_greedy_action(state)
+            episode_reward = 0
+            while True:
+                next_state, reward, done, _, info = self.env.step(action)
+                next_action = self.epsilon_greedy_action(next_state)
+                self.update_Q(state, action, reward, next_state, next_action)
+                episode_reward += reward
+                state = next_state
+                action = next_action
+                if episode_reward == max_reward or done:
+                    break
+            self.decay_epsilon()
+            rewards.append(episode_reward)
+        self.policy = dict((k, np.argmax(v)) for k, v in self.Q.items())
+        return np.array(epsilons), np.array(rewards)
+
+
+class SarsaNstepAgent(BaseAgent):
+    def __init__(self, env, alpha, gamma, n, epsilon=1.0, epsilon_decay=0.99, epsilon_min=0.1):
+        super().__init__(env, gamma, epsilon, epsilon_decay, epsilon_min)
+        self.alpha = alpha
+        self.n = n
+
+    def update_Q(self, tau, T, states_buffer, actions_buffer, rewards_buffer):
+        G = np.sum(
+            [
+                self.gamma ** (i - tau - 1) * rewards_buffer[i]
+                for i in range(tau + 1, min(tau + self.n, T))
+            ]
+        )
+        if tau + self.n < T:
+            G += (
+                self.gamma**self.n
+                * self.Q[states_buffer[tau + self.n]][actions_buffer[tau + self.n]]
+            )
+        Q = self.Q[states_buffer[tau]][actions_buffer[tau]]
+        target = G
+        self.Q[states_buffer[tau]][actions_buffer[tau]] = Q + self.alpha * (target - Q)
+
+    def train(self, num_episode, max_reward=5_000):
+        epsilons = []
+        episode_rewards = []
+        episode_lengths = []
+
+        for episode in tqdm(range(num_episode)):
+            epsilons.append(self.epsilon)
+            total_reward = 0
+
+            rewards_buffer = []
+            states_buffer = []
+            actions_buffer = []
+
+            state, info = self.env.reset()
+            states_buffer.append(state)
+
+            action = self.epsilon_greedy_action(state)
+            actions_buffer.append(action)
+
+            T = np.inf
+            t = 0
+            tau = 0
+
+            assert len(states_buffer) == len(actions_buffer)
+
+            while tau < (T - 1):
+
+                if t < T:
+                    next_state, reward, done, _, info = self.env.step(action)
+                    total_reward += reward
+                    rewards_buffer.append(reward)
+                    states_buffer.append(next_state)
+
+                    if total_reward == max_reward or done:
+                        T = t + 1
+                    else:
+                        next_action = self.epsilon_greedy_action(next_state)
+                        actions_buffer.append(next_action)
+
+                tau = t - self.n + 1
+
+                if tau >= 0:
+                    self.update_Q(tau, T, states_buffer, actions_buffer, rewards_buffer)
+
+                t += 1
+                state = next_state
+                action = next_action
+
+            self.decay_epsilon()
+            episode_rewards.append(np.sum(rewards_buffer))
+            episode_lengths.append(len(rewards_buffer))
+
+        self.policy = dict((k, np.argmax(v)) for k, v in self.Q.items())
+
+        return np.array(epsilons), np.array(episode_rewards), np.array(episode_lengths)
+
+
+class SarsaLambdaAgent(BaseAgent):
+    def __init__(self, env, alpha, gamma, lambd, epsilon=1.0, epsilon_decay=0.99, epsilon_min=0.1):
+        super().__init__(env, gamma, epsilon, epsilon_decay, epsilon_min)
+        self.alpha = alpha
+        self.lambd = lambd
+
+    def update_Q(self, state, action, reward, next_state, next_action, z):
+        delta = reward + self.gamma * self.Q[next_state][next_action] - self.Q[state][action]
+        z[state][action] += 1
+
+        for s in self.Q.keys():
+            for a in range(self.env.action_space.n):
+                self.Q[s][a] += self.alpha * delta * z[s][a]
+                z[s][a] *= self.gamma * self.lambd
+
+    def train(self, num_episode, max_reward=10_000):
+        epsilons = []
+        episode_rewards = []
+        episode_lengths = []
+
+        for episode in tqdm(range(num_episode)):
+            epsilons.append(self.epsilon)
+            total_reward = 0
+
+            rewards_buffer = []
+            states_buffer = []
+            actions_buffer = []
+
+            state, info = self.env.reset()
+            states_buffer.append(state)
+
+            action = self.epsilon_greedy_action(state)
+            actions_buffer.append(action)
+
+            z = defaultdict(lambda: np.zeros(self.env.action_space.n))
+
+            while True:
+                next_state, reward, done, _, info = self.env.step(action)
+                total_reward += reward
+                rewards_buffer.append(reward)
+                states_buffer.append(next_state)
+
+                next_action = self.epsilon_greedy_action(next_state)
+                actions_buffer.append(next_action)
+
+                self.update_Q(state, action, reward, next_state, next_action, z)
+
+                state = next_state
+                action = next_action
+
+                if total_reward == max_reward or done:
+                    break
+
+            self.decay_epsilon()
+            episode_rewards.append(np.sum(rewards_buffer))
+            episode_lengths.append(len(rewards_buffer))
+
+        self.policy = dict((k, np.argmax(v)) for k, v in self.Q.items())
+
+        return np.array(epsilons), np.array(episode_rewards), np.array(episode_lengths)
